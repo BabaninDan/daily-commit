@@ -1,6 +1,6 @@
 # Adds "date time - funny word" to daily-log.md, commits it and pushes (if a remote is set).
-# Runs from the Task Scheduler task "daily-commit" at logon, wake from sleep and unlock.
-# Makes at most one entry per day: later runs on the same day only push unpushed commits.
+# Runs from the Task Scheduler task "daily-commit" at logon and wake from sleep.
+# Makes a new entry on every launch (runs within 5 minutes of the last entry only push).
 
 $ErrorActionPreference = 'Stop'
 $env:GIT_TERMINAL_PROMPT = '0'   # never hang waiting for a password
@@ -21,7 +21,7 @@ function Invoke-Git {
     if ($LASTEXITCODE -ne 0) { throw "git $($args -join ' ') failed (exit $LASTEXITCODE)" }
 }
 
-# Logon, wake and unlock can fire together - let only one copy run.
+# Logon and wake can fire together - let only one copy run.
 $mutex = New-Object System.Threading.Mutex($false, 'Local\daily-commit')
 if (-not $mutex.WaitOne(0)) { exit 0 }
 
@@ -29,11 +29,18 @@ try {
     $git = (Get-Command git -ErrorAction SilentlyContinue).Source
     if (-not $git) { $git = 'C:\Program Files\Git\cmd\git.exe' }
 
-    $today = Get-Date -Format 'yyyy-MM-dd'
-    $doneToday = (Test-Path $logFile) -and
-        ([IO.File]::ReadAllLines($logFile, $utf8) | Where-Object { $_.StartsWith("- $today ") })
+    # One commit per launch. Logon and wake can both fire for the same launch,
+    # so skip if the last entry is less than 5 minutes old.
+    $recent = $false
+    if (Test-Path $logFile) {
+        $last = [IO.File]::ReadAllLines($logFile, $utf8) | Where-Object { $_ -match '^- \d{4}-' } | Select-Object -Last 1
+        if ($last -and $last.Length -ge 21) {
+            $lastTime = [datetime]::ParseExact($last.Substring(2, 19), 'yyyy-MM-dd HH:mm:ss', $null)
+            $recent = ((Get-Date) - $lastTime).TotalMinutes -lt 5
+        }
+    }
 
-    if (-not $doneToday) {
+    if (-not $recent) {
         $words = [IO.File]::ReadAllLines($wordsFile, $utf8) | Where-Object { $_.Trim() }
         $word  = ($words | Get-Random).Trim()
         $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
