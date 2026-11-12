@@ -1,5 +1,6 @@
 # Adds "date time - funny word" to daily-log.md, commits it and pushes (if a remote is set).
-# Runs automatically at Windows logon (shortcut in the Startup folder).
+# Runs from the Task Scheduler task "daily-commit" at logon, wake from sleep and unlock.
+# Makes at most one entry per day: later runs on the same day only push unpushed commits.
 
 $ErrorActionPreference = 'Stop'
 $env:GIT_TERMINAL_PROMPT = '0'   # never hang waiting for a password
@@ -20,23 +21,40 @@ function Invoke-Git {
     if ($LASTEXITCODE -ne 0) { throw "git $($args -join ' ') failed (exit $LASTEXITCODE)" }
 }
 
+# Logon, wake and unlock can fire together - let only one copy run.
+$mutex = New-Object System.Threading.Mutex($false, 'Local\daily-commit')
+if (-not $mutex.WaitOne(0)) { exit 0 }
+
 try {
     $git = (Get-Command git -ErrorAction SilentlyContinue).Source
     if (-not $git) { $git = 'C:\Program Files\Git\cmd\git.exe' }
 
-    $words = [IO.File]::ReadAllLines($wordsFile, $utf8) | Where-Object { $_.Trim() }
-    $word  = ($words | Get-Random).Trim()
-    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line  = "- $stamp - $word"
+    $today = Get-Date -Format 'yyyy-MM-dd'
+    $doneToday = (Test-Path $logFile) -and
+        ([IO.File]::ReadAllLines($logFile, $utf8) | Where-Object { $_.StartsWith("- $today ") })
 
-    [IO.File]::AppendAllText($logFile, "$line`r`n", $utf8)
+    if (-not $doneToday) {
+        $words = [IO.File]::ReadAllLines($wordsFile, $utf8) | Where-Object { $_.Trim() }
+        $word  = ($words | Get-Random).Trim()
+        $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $line  = "- $stamp - $word"
 
-    Invoke-Git add daily-log.md | Out-Null
-    Invoke-Git commit -m "$stamp - $word" | Out-Null
-    Write-RunLog "committed: $line"
+        [IO.File]::AppendAllText($logFile, "$line`r`n", $utf8)
 
-    # Push only if a remote exists. Network may not be up right after boot, so retry.
-    if (Invoke-Git remote) {
+        Invoke-Git add daily-log.md | Out-Null
+        Invoke-Git commit -m "$stamp - $word" | Out-Null
+        Write-RunLog "committed: $line"
+    }
+
+    # Anything left to push? (also catches pushes that failed earlier)
+    $hasRemote = [bool](Invoke-Git remote)
+    $unpushed  = $true
+    if ($hasRemote) {
+        try { $unpushed = [int](Invoke-Git rev-list --count '@{u}..HEAD') -gt 0 } catch { $unpushed = $true }
+    }
+
+    # Push only if a remote exists. Network may not be up right after wake, so retry.
+    if ($hasRemote -and $unpushed) {
         $pushed = $false
         for ($i = 1; $i -le 10 -and -not $pushed; $i++) {
             try {
@@ -52,4 +70,6 @@ try {
 } catch {
     Write-RunLog "ERROR: $_"
     exit 1
+} finally {
+    $mutex.ReleaseMutex()
 }
